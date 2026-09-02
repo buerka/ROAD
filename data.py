@@ -1,18 +1,21 @@
 """
     Dataloaders for LOFAR
 """
+import os
+
 import numpy as np
 import torch
 import torchvision.transforms as T
 from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
-import h5py
 
-from utils import args
 from utils.data import defaults
+from utils.data.lazy_h5 import (NormalizedMemmapStore,
+                                build_catalog,
+                                normalise_sample)
 
 
-def get_data(args: args,
+def get_data(args,
              remove: str = None,
              transform=None) -> (Dataset, Dataset, Dataset, Dataset, Dataset):
     """
@@ -33,96 +36,103 @@ def get_data(args: args,
         supervised_train_dataset: ...
         supervised_val_dataset: ...
     """
-    _hf = h5py.File(args.data_path, 'r')
-    (test_indexes,
-     train_indexes) = train_test_split(np.arange(
-                                       len(_join(_hf, 'labels').astype(str))),
-                                       test_size=args.percentage_data,
-                                       random_state=args.seed)
+    catalog = build_catalog(args.data_path, defaults.anomalies)
+    print(
+        "ROAD catalog: "
+        f"{catalog.physical_sample_count} physical rows, "
+        f"{catalog.unique_sample_count} unique samples, "
+        f"{catalog.multi_label_sample_count} multi-label samples. "
+        "Preserving the original exact-single-label protocol with "
+        f"{catalog.experiment_sample_count} samples."
+    )
 
-    if args.percentage_data != 0.5:  # to always test on 50% of the data
-        test_indexes = test_indexes[:len(_join(_hf, 'labels'))//2]
+    cache_dir = getattr(args, 'data_cache_path', None)
+    if cache_dir is None:
+        cache_root = getattr(args, 'model_path', None)
+        if cache_root is None:
+            cache_root = os.path.dirname(os.path.abspath(args.data_path))
+        cache_dir = os.path.join(cache_root, '.road_cache')
 
-    _data = _join(_hf, 'data')[train_indexes]
-    _labels = _join(_hf, 'labels').astype(str)[train_indexes]
-    _frequency_band = _join(_hf, 'frequency_band')[train_indexes]
-    _source = _join(_hf, 'source').astype(str)[train_indexes]
+    store = NormalizedMemmapStore(args.data_path,
+                                  catalog.experiment_records,
+                                  args.amount,
+                                  cache_dir)
 
-    (train_data, val_data,
-     train_labels, val_labels,
-     train_frequency_band, val_frequency_band,
-     train_source, val_source) = train_test_split(_data,
-                                                  _labels,
-                                                  _frequency_band,
-                                                  _source,
-                                                  test_size=0.05,
-                                                  random_state=args.seed)
+    n_train = len(catalog.train_records)
+    n_evaluation = len(catalog.evaluation_records)
+    ssl_indexes = np.arange(n_train, dtype=np.int64)
+    evaluation_indexes = np.arange(n_train,
+                                   n_train + n_evaluation,
+                                   dtype=np.int64)
 
-    supervised_train_dataset = LOFARDataset(train_data,
-                                            train_labels,
-                                            train_frequency_band,
-                                            train_source,
-                                            args,
-                                            test=False,
-                                            transform=transform,
-                                            remove=remove,
-                                            roll=False,
-                                            supervised=True)
+    # Preserve the original split direction and ordering exactly.  The first
+    # return value is deliberately named test_indexes in the source paper.
+    (test_positions,
+     train_positions) = train_test_split(np.arange(n_evaluation),
+                                         test_size=args.percentage_data,
+                                         random_state=args.seed)
+    test_indexes = evaluation_indexes[test_positions]
+    train_indexes = evaluation_indexes[train_positions]
 
-    supervised_val_dataset = LOFARDataset(val_data,
-                                          val_labels,
-                                          val_frequency_band,
-                                          val_source,
-                                          args,
-                                          test=False,
-                                          transform=None,
-                                          remove=remove,
-                                          supervised=True)
+    if args.percentage_data != 0.5:  # always test on at most 50% of data
+        test_indexes = test_indexes[:n_evaluation//2]
 
-    (train_data,
-     val_data,
-     train_labels,
-     val_labels,
-     train_frequency_band,
-     val_frequency_band,
-     train_source,
-     val_source) = train_test_split(_hf['train_data/data'][:],
-                                    _hf['train_data/labels'][:].astype(str),
-                                    _hf['train_data/frequency_band'][:],
-                                    _hf['train_data/source'][:].astype(str),
-                                    test_size=0.05,
-                                    random_state=args.seed)
+    (supervised_train_indexes,
+     supervised_val_indexes) = train_test_split(train_indexes,
+                                                test_size=0.05,
+                                                random_state=args.seed)
+    (ssl_train_indexes,
+     ssl_val_indexes) = train_test_split(ssl_indexes,
+                                         test_size=0.05,
+                                         random_state=args.seed)
 
-    train_dataset = LOFARDataset(train_data,
-                                 train_labels,
-                                 train_frequency_band,
-                                 train_source,
-                                 args,
-                                 test=False,
-                                 transform=transform,
-                                 roll=False,
-                                 remove=None,
-                                 supervised=False)
-
-    val_dataset = LOFARDataset(val_data,
-                               val_labels,
-                               val_frequency_band,
-                               val_source,
-                               args,
-                               test=False,
-                               transform=None,
-                               remove=None,
-                               supervised=False)
-
-    test_dataset = LOFARDataset(_join(_hf, 'data')[test_indexes],
-                                _join(_hf, 'labels').astype(str)[test_indexes],
-                                _join(_hf, 'frequency_band')[test_indexes],
-                                _join(_hf, 'source').astype(str)[test_indexes],
-                                args,
-                                test=True,
-                                transform=None,
-                                remove=None,
-                                supervised=False)
+    supervised_train_dataset = LOFARDataset(
+        store,
+        supervised_train_indexes,
+        args,
+        test=False,
+        transform=transform,
+        remove=remove,
+        roll=False,
+        supervised=True,
+    )
+    supervised_val_dataset = LOFARDataset(
+        store,
+        supervised_val_indexes,
+        args,
+        test=False,
+        transform=None,
+        remove=remove,
+        supervised=True,
+    )
+    train_dataset = LOFARDataset(
+        store,
+        ssl_train_indexes,
+        args,
+        test=False,
+        transform=transform,
+        roll=False,
+        remove=None,
+        supervised=False,
+    )
+    val_dataset = LOFARDataset(
+        store,
+        ssl_val_indexes,
+        args,
+        test=False,
+        transform=None,
+        remove=None,
+        supervised=False,
+    )
+    test_dataset = LOFARDataset(
+        store,
+        test_indexes,
+        args,
+        test=True,
+        transform=None,
+        remove=None,
+        supervised=False,
+    )
 
     return (train_dataset,
             val_dataset,
@@ -131,49 +141,19 @@ def get_data(args: args,
             supervised_val_dataset)
 
 
-def _join(_hf: h5py.File,
-          field: str,
-          compound: bool = False) -> np.array:
-    """
-        Joins together the normal and anomalous testing data
-
-        Parameters
-        ----------
-        _hf: h5py dataset
-        field: the field that is meant to be concatenated along
-        compound: if multiple features can be present in a spectrogram
-
-        Returns
-        -------
-        data: concatenated array
-
-    """
-    data = _hf['test_data/{}'.format(field)][:]
-    for a in defaults.anomalies:
-        if a != 'all':
-            labels = _hf['anomaly_data/{}/labels'.format(a)][:].astype(str)
-            if not compound:
-                mask = [_l == a for _l in labels]
-            else:
-                mask = [True for _l in labels]
-            _data = _hf['anomaly_data/{}/{}'.format(a, field)][:][mask]
-            data = np.concatenate([data, _data], axis=0)
-    return data
-
-
 class LOFARDataset(Dataset):
     def __init__(self,
-                 data: np.array,
-                 labels: np.array,
-                 frequency_band: np.array,
-                 source: np.array,
-                 args: args,
+                 store: NormalizedMemmapStore,
+                 indexes: np.ndarray,
+                 args,
                  test: bool,
                  transform=None,
                  remove=None,
                  roll=False,
                  supervised=False):
 
+        self._store = store
+        self._base_indexes = np.asarray(indexes, dtype=np.int64)
         self.supervised = supervised
         self.test = test
         self.test_seed = args.seed
@@ -183,29 +163,38 @@ class LOFARDataset(Dataset):
         self.original_anomaly_mask = []
         self.n_patches = int(defaults.SIZE[0]/args.patch_size)
 
+        raw_labels = self._store.raw_labels[self._base_indexes]
+        sources = self._store.sources[self._base_indexes]
+        sample_ids = self._store.sample_ids[self._base_indexes]
+
         if not self.test and args.ood != -1:
             np.random.seed(self.test_seed)
             classes = np.random.choice(defaults.anomalies,
                                        size=args.ood,
                                        replace=False)
             print(f'removing {classes}')
-            mask = np.ones(len(labels), dtype=bool)
+            mask = np.ones(len(raw_labels), dtype=bool)
             for c in classes:
-                mask = np.logical_and(mask, labels != c)
+                mask = np.logical_and(mask, raw_labels != c)
+            # Deliberately preserve the published code's no-op: it computed
+            # this OOD mask but never applied it.  Applying it here would
+            # change the experiment rather than only its storage behavior.
 
         if remove is not None:
-            mask = labels != remove
-            labels = labels[mask]
-            source = source[mask]
-            data = data[mask]
-            frequency_band = frequency_band[mask]
+            mask = raw_labels != remove
+            self._base_indexes = self._base_indexes[mask]
+            raw_labels = raw_labels[mask]
+            sources = sources[mask]
+            sample_ids = sample_ids[mask]
 
-        self._labels = torch.from_numpy(self.encode_labels(labels))
-        self._source = source
-        self._data = torch.from_numpy(self.normalise(data)).permute(0, 3,
-                                                                    1, 2)
-        self._frequency_band = torch.from_numpy(frequency_band).permute(0, 3,
-                                                                        1, 2)
+        self._raw_labels = raw_labels
+        self._labels = torch.from_numpy(self.encode_labels(raw_labels))
+        self._source = sources
+        self._sample_ids = sample_ids
+        self._active_positions = np.arange(len(self._base_indexes),
+                                           dtype=np.int64)
+        self._materialized_data = None
+        self._materialized_frequency_band = None
 
         self.resizer = T.RandomResizedCrop(scale=(1.0-args.resize_amount, 1.0),
                                            size=(args.patch_size,
@@ -215,21 +204,25 @@ class LOFARDataset(Dataset):
         self.set_anomaly_mask(-1)
 
     def __len__(self):
-        return len(self.data)
+        return len(self._active_positions)
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
+        position = int(self._active_positions[idx])
+        store_index = int(self._base_indexes[position])
+        datum = torch.from_numpy(self._store.get_data(store_index))
+
         if self.supervised:
-            datum = self.data[idx]
-            label = self.labels[idx]
-            source = self.source[idx]
+            label = self._labels[position]
+            source = self._source[position]
             return datum, label, source
 
         else:
-            label = np.repeat(self.labels[idx], self.n_patches**2, axis=0)
-            datum = self.patch(self.data[idx:idx+1, ...])
+            label = np.repeat(self._labels[position], self.n_patches**2,
+                              axis=0)
+            datum = self.patch(datum.unsqueeze(0))
 
             (context_label,
              context_image_neighbour) = self.context_prediction(datum)
@@ -238,6 +231,52 @@ class LOFARDataset(Dataset):
                 datum = self.transform(datum)
 
             return datum, label, context_label, context_image_neighbour
+
+    @property
+    def active_store_indexes(self) -> np.ndarray:
+        """Indices into the one shared cache for the current dataset view."""
+
+        return self._base_indexes[self._active_positions]
+
+    @property
+    def data(self) -> torch.Tensor:
+        """Materialize the active view only when legacy callers require it."""
+
+        if self._materialized_data is None:
+            values = self._store.materialize_data(self.active_store_indexes)
+            self._materialized_data = torch.from_numpy(values)
+        return self._materialized_data
+
+    @property
+    def frequency_band(self) -> torch.Tensor:
+        """Load frequency arrays only if a caller actually asks for them."""
+
+        if self._materialized_frequency_band is None:
+            values = self._store.materialize_frequency(
+                self.active_store_indexes
+            )
+            self._materialized_frequency_band = torch.from_numpy(values)
+        return self._materialized_frequency_band
+
+    @property
+    def labels(self) -> torch.Tensor:
+        return self._labels[self._active_positions]
+
+    @property
+    def source(self) -> np.ndarray:
+        return self._source[self._active_positions]
+
+    @property
+    def sample_ids(self) -> np.ndarray:
+        return self._sample_ids[self._active_positions]
+
+    @property
+    def raw_labels(self) -> np.ndarray:
+        return self._raw_labels[self._active_positions]
+
+    def _invalidate_materialized_views(self) -> None:
+        self._materialized_data = None
+        self._materialized_frequency_band = None
 
     def set_supervision(self, supervised: bool) -> None:
         """
@@ -270,10 +309,12 @@ class LOFARDataset(Dataset):
                                      assume_unique=True,
                                      return_indices=True)
         mask = [i not in indxs for i in range(len(self._source))]
-        self._data = self._data[mask]
+        self._base_indexes = self._base_indexes[mask]
+        self._raw_labels = self._raw_labels[mask]
         self._labels = self._labels[mask]
-        self._frequency_band = self._frequency_band[mask]
         self._source = self._source[mask]
+        self._sample_ids = self._sample_ids[mask]
+        self._invalidate_materialized_views()
         self.set_anomaly_mask(-1)
 
     def set_seed(self, seed: int) -> None:
@@ -310,24 +351,22 @@ class LOFARDataset(Dataset):
         if self.test:
             subsample_mask = self.subsample(self._labels)
         else:
-            subsample_mask = [True]*len(self._data)
+            subsample_mask = np.arange(len(self._base_indexes), dtype=np.int64)
 
-        self.data = self._data[subsample_mask]
-        self.labels = self._labels[subsample_mask]
-        self.frequency_band = self._frequency_band[subsample_mask]
-        self.source = self._source[subsample_mask]
+        subsample_mask = np.asarray(subsample_mask, dtype=np.int64)
+        subsample_labels = self._labels[subsample_mask]
 
         if anomaly == -1:
-            self.anomaly_mask = [True]*len(self.data)
+            self.anomaly_mask = [True]*len(subsample_mask)
         else:
             self.anomaly_mask = [((anomaly == _l) |
                                   (_l == len(defaults.anomalies)))
-                                 for _l in self.labels]
+                                 for _l in subsample_labels]
 
-        self.data = self.data[self.anomaly_mask]
-        self.labels = self.labels[self.anomaly_mask]
-        self.frequency_band = self.frequency_band[self.anomaly_mask]
-        self.source = self.source[self.anomaly_mask]
+        self._active_positions = subsample_mask[
+            np.asarray(self.anomaly_mask, dtype=bool)
+        ]
+        self._invalidate_materialized_views()
 
     def subsample(self, labels: np.array) -> np.array:
         """
@@ -393,18 +432,12 @@ class LOFARDataset(Dataset):
             normalised_data: ...
 
         """
-        _data = np.zeros(data.shape)
-        for i, spec in enumerate(data):
-            for pol in range(data.shape[-1]):
-                _min, _max = np.percentile(spec[..., pol],
-                                           [self.args.amount,
-                                           100-self.args.amount])
-                temp = np.clip(spec[..., pol], _min, _max)
-                temp = np.log(temp)
-                temp = (temp - np.min(temp)) / (np.max(temp) - np.min(temp))
-                _data[i, ..., pol] = temp
-        _data = np.nan_to_num(_data, 0)
-        return _data
+        if len(data) == 0:
+            return np.zeros(data.shape)
+        return np.stack([
+            normalise_sample(sample, self.args.amount)
+            for sample in data
+        ])
 
     def patch(self, _input: torch.tensor) -> torch.tensor:
         """
