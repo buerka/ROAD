@@ -80,15 +80,17 @@ def fine_tune(supervised_train_dataloader: DataLoader,
 
                 loss.backward()
                 optimizer.step()
-                running_loss += loss.item()
+                loss_value = loss.item()
+                running_loss += loss_value
 
                 ####
                 backbone.eval()
                 classification_head.eval()
-                _z = backbone(_val_data)
-                Z = _z.reshape([len(_z)//int(defaults.SIZE[0]//args.patch_size)**2,
-                                args.latent_dim*int(defaults.SIZE[0]//args.patch_size)**2])
-                _c = classification_head(Z).squeeze(1)
+                with torch.no_grad():
+                    _z = backbone(_val_data)
+                    Z = _z.reshape([len(_z)//int(defaults.SIZE[0]//args.patch_size)**2,
+                                    args.latent_dim*int(defaults.SIZE[0]//args.patch_size)**2])
+                    _c = classification_head(Z).squeeze(1)
                 backbone.train()
                 classification_head.train()
 
@@ -102,7 +104,7 @@ def fine_tune(supervised_train_dataloader: DataLoader,
                 val_acc = f_score[0]
                 running_acc += val_acc
 
-                tepoch.set_postfix(total_loss=loss.item(),
+                tepoch.set_postfix(total_loss=loss_value,
                                    train_accuracy=val_acc.item())
 
             total_train_loss.append(running_loss / total_step)

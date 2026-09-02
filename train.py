@@ -136,16 +136,18 @@ def train_supervised(
 
                 loss.backward()
                 optimizer.step()
-                running_loss += loss.item()
+                loss_value = loss.item()
+                running_loss += loss_value
 
                 # Validation
                 backbone.eval()
-                c = backbone(_val_data).cpu().detach()
-                val_acc = torch.sum(
-                    c.argmax(
-                        dim=-1) == _val_targets) / _val_targets.shape[0]
+                with torch.no_grad():
+                    c = backbone(_val_data).cpu()
+                    val_acc = torch.sum(
+                        c.argmax(
+                            dim=-1) == _val_targets) / _val_targets.shape[0]
                 running_acc += val_acc
-                tepoch.set_postfix(loss=loss.item(), val_acc=val_acc.item())
+                tepoch.set_postfix(loss=loss_value, val_acc=val_acc.item())
                 backbone.train()
 
             train_loss.append(running_loss / total_step)
@@ -212,6 +214,12 @@ def train_ssl(train_dataloader: DataLoader,
     validation_accuracies = []
     total_step = len(train_dataloader)
     prev_acc = 0
+    # Patching the validation images is deterministic.  Keep the random
+    # context sampling inside the step loop so the published RNG stream and
+    # validation cadence remain unchanged.
+    _val_patches = val_dataset.patch(val_dataset.data)
+    _val_data = _val_patches.float().to(args.device,
+                                         dtype=torch.bfloat16)
 
     for epoch in range(1, args.epochs + 1):
         with tqdm(train_dataloader, unit="batch") as tepoch:
@@ -254,38 +262,43 @@ def train_ssl(train_dataloader: DataLoader,
                 position_classifier_optimizer.step()
                 decoder_optimizer.step()
 
-                running_loss += loss.item()
-                l_loss += location_loss.item()
-                d_loss += decoder_loss.item()
-                r_loss += reg_loss.item()
+                loss_value = loss.item()
+                location_loss_value = location_loss.item()
+                decoder_loss_value = decoder_loss.item()
+                reg_loss_value = reg_loss.item()
+                running_loss += loss_value
+                l_loss += location_loss_value
+                d_loss += decoder_loss_value
+                r_loss += reg_loss_value
 
                 # Validation
                 backbone.eval()
                 decoder.eval()
                 position_classifier.eval()
-                _data = val_dataset.patch(val_dataset.data)
-                _labels, _neighbour = val_dataset.context_prediction(_data)
-                _data = _data.float().to(args.device, dtype=torch.bfloat16)
+                _labels, _neighbour = val_dataset.context_prediction(
+                    _val_patches
+                )
 
                 _neighbour = _neighbour.float()
                 _neighbour = _neighbour.to(args.device, dtype=torch.bfloat16)
-                z_data = backbone(_data)
-                z_neighbour = backbone(_neighbour)
+                with torch.no_grad():
+                    z_data = backbone(_val_data)
+                    z_neighbour = backbone(_neighbour)
 
-                c_pos = position_classifier(z_data, z_neighbour).cpu().detach()
-                val_acc_context = torch.sum(
-                    c_pos.argmax(
-                        dim=-1) == _labels) / _labels.shape[0]
+                    c_pos = position_classifier(z_data, z_neighbour).cpu()
+                    val_acc_context = torch.sum(
+                        c_pos.argmax(
+                            dim=-1) == _labels) / _labels.shape[0]
                 running_acc += val_acc_context
 
                 backbone.train()
                 decoder.train()
                 position_classifier.train()
 
-                tepoch.set_postfix(total_loss=loss.item(),
-                                   location_loss=location_loss.item(),
-                                   decoder_loss=decoder_loss.item(),
-                                   regulation_loss=reg_loss.item(),
+                tepoch.set_postfix(total_loss=loss_value,
+                                   location_loss=location_loss_value,
+                                   decoder_loss=decoder_loss_value,
+                                   regulation_loss=reg_loss_value,
                                    location_accuracy=val_acc_context.item())
 
             total_loss.append(running_loss/total_step)

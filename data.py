@@ -2,10 +2,13 @@
     Dataloaders for LOFAR
 """
 import os
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
 
@@ -13,6 +16,26 @@ from utils.data import defaults
 from utils.data.lazy_h5 import (NormalizedMemmapStore,
                                 build_catalog,
                                 normalise_sample)
+
+
+def _fixed_resized_crop(task):
+    """Apply one already-sampled context crop without consuming RNG state."""
+    (output_index,
+     source_patch,
+     crop_parameters,
+     size,
+     interpolation,
+     antialias) = task
+    top, left, height, width = crop_parameters
+    resized = TF.resized_crop(source_patch,
+                              top,
+                              left,
+                              height,
+                              width,
+                              size,
+                              interpolation,
+                              antialias=antialias)
+    return output_index, resized
 
 
 def get_data(args,
@@ -162,6 +185,11 @@ class LOFARDataset(Dataset):
         self.anomaly_mask = []
         self.original_anomaly_mask = []
         self.n_patches = int(defaults.SIZE[0]/args.patch_size)
+        self.context_workers = int(getattr(args, 'context_workers', 1))
+        if self.context_workers < 0:
+            raise ValueError("context_workers must be non-negative")
+        self._context_executor = None
+        self._context_executor_pid = None
 
         raw_labels = self._store.raw_labels[self._base_indexes]
         sources = self._store.sources[self._base_indexes]
@@ -202,6 +230,49 @@ class LOFARDataset(Dataset):
                                            antialias=False)
         self.transform = transform
         self.set_anomaly_mask(-1)
+
+    def _get_context_executor(self):
+        """Return this process's lazily-created context crop thread pool."""
+        if self.context_workers <= 1:
+            return None
+
+        process_id = os.getpid()
+        if self._context_executor_pid != process_id:
+            # A ThreadPoolExecutor cannot survive fork.  Do not call shutdown
+            # on an executor inherited from the parent: its worker threads do
+            # not exist in the child process.
+            self._context_executor = None
+            self._context_executor_pid = None
+
+        if self._context_executor is None:
+            self._context_executor = ThreadPoolExecutor(
+                max_workers=self.context_workers,
+                thread_name_prefix="road-context",
+            )
+            self._context_executor_pid = process_id
+        return self._context_executor
+
+    def _shutdown_context_executor(self, wait=True, cancel_futures=False):
+        executor = getattr(self, '_context_executor', None)
+        executor_pid = getattr(self, '_context_executor_pid', None)
+        self._context_executor = None
+        self._context_executor_pid = None
+        if executor is not None and executor_pid == os.getpid():
+            executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    def __getstate__(self):
+        """Keep Windows spawn/DataLoader pickling free of thread handles."""
+        state = self.__dict__.copy()
+        state['_context_executor'] = None
+        state['_context_executor_pid'] = None
+        return state
+
+    def __del__(self):
+        try:
+            self._shutdown_context_executor(wait=False,
+                                            cancel_futures=True)
+        except Exception:
+            pass
 
     def __len__(self):
         return len(self._active_positions)
@@ -493,6 +564,8 @@ class LOFARDataset(Dataset):
                                              self.args.patch_size],
                                             dtype='float32')
         _indx = 0
+        parallel_crops = self.context_workers > 1
+        crop_tasks = [] if parallel_crops else None
         _locations = [-self.n_patches-1,
                       -self.n_patches,
                       -self.n_patches+1,
@@ -546,9 +619,59 @@ class LOFARDataset(Dataset):
                                                               4, 5, 6, 7])
 
                 _ni = _patch_index + _locations[context_labels[_indx]]
-                resized_patch = self.resizer(temp_patches[_ni])
-                context_images_neighbour[_indx, :] = resized_patch
+                source_patch = temp_patches[_ni]
+                if parallel_crops:
+                    # Keep this RNG call on the main thread and immediately
+                    # after the matching NumPy label draw.  Moving it into a
+                    # worker would make seeded runs scheduling-dependent.
+                    crop_parameters = T.RandomResizedCrop.get_params(
+                        source_patch,
+                        self.resizer.scale,
+                        self.resizer.ratio,
+                    )
+                    crop_tasks.append((_indx,
+                                       source_patch,
+                                       crop_parameters,
+                                       self.resizer.size,
+                                       self.resizer.interpolation,
+                                       self.resizer.antialias))
+                else:
+                    # Preserve the published serial path exactly, including
+                    # when crop errors happen relative to later RNG draws.
+                    resized_patch = self.resizer(source_patch)
+                    context_images_neighbour[_indx, :] = resized_patch
                 _indx += 1
+
+        if parallel_crops and crop_tasks:
+            executor = self._get_context_executor()
+            # Bound submitted work so a large validation set cannot retain a
+            # second full set of completed crop tensors while waiting for the
+            # main thread to write results in the original index order.
+            pending = deque()
+            max_pending = max(1, self.context_workers * 2)
+            tasks = iter(crop_tasks)
+            try:
+                for _ in range(max_pending):
+                    task = next(tasks, None)
+                    if task is None:
+                        break
+                    pending.append(executor.submit(_fixed_resized_crop, task))
+
+                while pending:
+                    future = pending.popleft()
+                    output_index, resized_patch = future.result()
+                    context_images_neighbour[output_index, :] = resized_patch
+                    task = next(tasks, None)
+                    if task is not None:
+                        pending.append(
+                            executor.submit(_fixed_resized_crop, task)
+                        )
+            except BaseException:
+                for future in pending:
+                    future.cancel()
+                self._shutdown_context_executor(wait=True,
+                                                cancel_futures=True)
+                raise
         context_labels = torch.from_numpy(context_labels)
         context_images_neighbour = torch.from_numpy(context_images_neighbour)
 

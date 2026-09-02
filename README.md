@@ -58,6 +58,25 @@ Cache identity includes the HDF5 path, size, modification time, normalization
 amount, record order, and cache format version.  Concurrent first runs wait on
 one cache builder instead of generating duplicate 12 GiB temporary files.
 
+Context-prediction crops can use the host CPU cores without changing the
+paper's sampling sequence.  ROAD samples every context label and every
+`RandomResizedCrop` parameter on the main thread in the original order; worker
+threads only apply those fixed crop parameters and return results to their
+original indexes.  The default uses two crop workers:
+
+```
+python main.py -data_path /path/to/ROAD_dataset.h5 \
+    -model_path /path/to/run-root \
+    -context_workers 2
+```
+
+Set `-context_workers 0` or `-context_workers 1` for serial execution.  This
+setting does not change DataLoader workers, batch size, validation cadence, or
+the random sequence.  On the 8-core/16-thread replication host, benchmark 2
+workers first and then 4 if useful.  Do not automatically use all 16 logical
+CPUs: torchvision/PyTorch operators can use CPU threads internally, so a large
+external pool can oversubscribe the processor and reduce throughput.
+
 
 
 ## Replication of results in paper 

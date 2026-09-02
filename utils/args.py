@@ -21,6 +21,7 @@ parser.add_argument('-seed', metavar='-s', type=int, default=42, help = 'The ran
 parser.add_argument('-verbose', metavar='-v', type=str, help = 'Verbose output')
 parser.add_argument('-patch_size', metavar='-ps', type=int, default=32, help = 'Dimension of patches')
 parser.add_argument('-batch_size', metavar='-bs', type=int, default=2**11, help = 'Batch size')
+parser.add_argument('-context_workers', metavar='-cw', type=int, default=2, help = 'CPU threads for deterministic context crops; use 0 or 1 for serial execution')
 parser.add_argument('-learning_rate', metavar='-lr', type=float, default=1e-3, help = 'Learning rate')
 parser.add_argument('-hidden_dims', metavar='-hd', nargs='+',type=int, default=[32,64,128,256], help = 'Hidden dims for VAE')
 parser.add_argument('-percentage_data', metavar='-pd', type=float, default=0.5, help = 'Percentage training data')
